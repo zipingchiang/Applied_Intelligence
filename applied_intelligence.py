@@ -387,7 +387,7 @@ def build_continuous_capabilities(
         world, wtab = construct_equal_weight_proxy(
             [mm, tool],
             ["multimodal_flag", "tool_use_flag"],
-            "World_Model",
+            "World-Interaction",
         )
         weight_tables.append(wtab)
         world_mode = "proxy_equal_denested"
@@ -420,7 +420,7 @@ def build_continuous_capabilities(
         "Reasoning": reasoning,
         "Reasoning_Inspectability": reasoning_inspectability,
         "Reasoning_Faithfulness": reasoning_faithfulness,
-        "World_Model": world,
+        "World-Interaction": world,
         "Agency": agency,
     }, index=df.index)
 
@@ -429,7 +429,7 @@ def build_continuous_capabilities(
         ("Reasoning", reasoning_mode, reasoning_note),
         ("Reasoning_Inspectability", inspect_mode, inspect_note),
         ("Reasoning_Faithfulness", faith_mode, faith_note),
-        ("World_Model", world_mode, world_note),
+        ("World-Interaction", world_mode, world_note),
         ("Agency", agency_mode, agency_note),
     ]
     metadata = pd.DataFrame(rows, columns=["capability", "measurement_mode", "note"])
@@ -881,7 +881,7 @@ def assign_regimes(
 
     for i in range(len(df)):
         reasoning = float(cap.loc[i, "Reasoning"])
-        world = float(cap.loc[i, "World_Model"])
+        world = float(cap.loc[i, "World-Interaction"])
         agency = float(cap.loc[i, "Agency"])
 
         r3 = (
