@@ -20,14 +20,14 @@ RANDOM_SEED = 42
 CAPABILITY_ORDER = [
     "Scale",
     "Reasoning",
-    "World_Model",
+    "World-Interaction",
     "Agency",
 ]
 
 REGIME_NAMES = [
     "R1_Predictive_Scaling",
     "R2_Reasoning_Centered",
-    "R3_World_Model_Agentic",
+    "R3_World-Interaction_Agentic",
 ]
 
 REQUIRED_COLUMNS = [
