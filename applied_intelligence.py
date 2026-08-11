@@ -82,7 +82,7 @@ Upload this .py and the CSV to a Google Colab session, then run:
 
     !python applied_intelligence_SRWA_colab_analysis.py \
         --csv llm_history_SRWA_analysis_input.csv \
-        --outdir results --period quarter --break-bootstrap 1000
+        --outdir results --period quarter --break-bootstrap 100
 
 If packages are unavailable in a future Colab runtime:
 
@@ -113,8 +113,7 @@ from sklearn.feature_selection import mutual_info_regression
 import matplotlib.pyplot as plt
 
 
-RANDOM_SEED = 42
-N_BOOTSTRAP = 1000
+RANDOM_SEED = 20260810
 
 CAPABILITY_ORDER = [
     "Scale",
@@ -186,8 +185,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--r3-agency-threshold", type=float, default=0.35)
     p.add_argument("--r3-world-threshold", type=float, default=0.35)
     p.add_argument(
-        "--break-bootstrap", type=int, default=N_BOOTSTRAP,
-        help="Optional within-period multinomial bootstrap replicates for structural-break strength. Default 1000 for a more stable manuscript robustness analysis; set 0 only for a faster exploratory run."
+        "--break-bootstrap", type=int, default=100,
+        help="Optional within-period multinomial bootstrap replicates for structural-break strength. Default 100 to reproduce the manuscript robustness analysis; set 0 only for a faster exploratory run."
     )
     p.add_argument(
         "--threshold-grid", type=str, default="0.30,0.35,0.40",
