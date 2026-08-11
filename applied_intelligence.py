@@ -1,101 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Nonlinear Capability Dynamics + ANP + Three-Regime Technological Markov Model
-for Large-Language-Model Evolution
-==========================================================================
-
-Scientific purpose
-------------------
-This script implements the revised empirical framework for the manuscript:
-
-  1) The empirical continuous state is fixed to four NON-exclusive dimensions,
-
-         x_t = [S_t, R_t, W_t, A_t]^T,
-
-     where S is scale, R reasoning, W world-model/world-interaction capability,
-     and A agency. Memory and temporal continuity are not components of the
-     empirical state vector in this analysis.
-
-  2) A data-driven Analytic Network Process (ANP) represents cross-capability
-     statistical interdependence among S, R, W, and A. ANP is a dependence
-     structure, not a causal graph.
-
-  3) The empirical Markov state space contains exactly three mutually exclusive
-     technological regimes:
-
-         R1 Predictive Scaling
-         R2 Reasoning-Centered
-         R3 World-Model / Agentic
-
-     Persistent computational individuality is outside the currently estimated
-     empirical Markov state space. No persistent-individuality state or persistent-individuality transition probability is
-     fitted, because the historical database does not provide standardized
-     longitudinal measurements needed to operationalize such a regime.
-
-  4) Reasoning inspectability is retained only as an auxiliary measurement layer.
-     Observable reasoning may improve inspectability, but this program never
-     equates visible reasoning with faithful explanation or mechanistic XAI.
-
-  5) Reviewer-facing validation includes ANP/network ablation, homogeneous and
-     time-varying Markov baselines, structural-break diagnostics, threshold and
-     temporal-aggregation sensitivity, provenance-restricted sensitivity, and
-     bootstrap assessment.
-
-Interpretation boundary
------------------------
-The historical data can test dynamics within the four-dimensional empirical
-capability state and the three observed technological regimes. They cannot by
-themselves identify a persistent-computational-individuality regime. This is an
-identification boundary, not evidence that such a regime is impossible.
-
-Expected input
---------------
-Primary input:
-    llm_history_SRWA_analysis_input.csv
-
-The compatible legacy name llm_history_postimputation_complete_matrix.csv is also
-recognized automatically. Required columns include model/date, log10 parameters,
-training compute, training-data size, and reasoning/tool/agentic/code/multimodal/
-frontier flags.
-
-Optional direct scores are used when supplied:
-    reasoning_score
-    reasoning_benchmark_score
-    world_model_score
-    world_model_benchmark_score
-    autonomous_agent_score
-    agentic_score
-    agent_benchmark_score
-
-Optional reasoning-inspectability / faithfulness columns are also recognized:
-    reasoning_inspectability_score
-    reasoning_trace_score
-    cot_observability_score
-    chain_of_thought_observability_score
-    reasoning_faithfulness_score
-    cot_faithfulness_score
-
-Colab
------
-Upload this .py and the CSV to a Google Colab session, then run:
-
-    !python applied_intelligence_SRWA_colab_analysis.py \
-        --csv llm_history_SRWA_analysis_input.csv \
-        --outdir results --period quarter --break-bootstrap 100
-
-If packages are unavailable in a future Colab runtime:
-
-    !pip -q install numpy pandas scipy scikit-learn matplotlib
-
-Dependencies
-------------
-Python 3.9+; numpy, pandas, scipy, scikit-learn, matplotlib.
-No network access is required by the analysis itself.
-"""
-
-from __future__ import annotations
-
 import argparse
 import json
 import math
@@ -113,7 +15,7 @@ from sklearn.feature_selection import mutual_info_regression
 import matplotlib.pyplot as plt
 
 
-RANDOM_SEED = 20260810
+RANDOM_SEED = 42
 
 CAPABILITY_ORDER = [
     "Scale",
@@ -149,6 +51,7 @@ REQUIRED_COLUMNS = [
 class CapabilityBuildResult:
     values: pd.DataFrame
     metadata: pd.DataFrame
+    proxy_weights: pd.DataFrame
     active_names: List[str]
     direct_reasoning_inspectability_available: bool
     direct_reasoning_faithfulness_available: bool
@@ -185,8 +88,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--r3-agency-threshold", type=float, default=0.35)
     p.add_argument("--r3-world-threshold", type=float, default=0.35)
     p.add_argument(
-        "--break-bootstrap", type=int, default=100,
-        help="Optional within-period multinomial bootstrap replicates for structural-break strength. Default 100 to reproduce the manuscript robustness analysis; set 0 only for a faster exploratory run."
+        "--break-bootstrap", type=int, default=1000,
+        help="Optional within-period multinomial bootstrap replicates for structural-break strength. Default 1000 for the manuscript robustness analysis; set 0 only for a faster exploratory run."
     )
     p.add_argument(
         "--threshold-grid", type=str, default="0.30,0.35,0.40",
@@ -273,6 +176,40 @@ def robust_scale_01(x: Sequence[float], qlo: float = 0.05, qhi: float = 0.95) ->
     return z
 
 
+def construct_equal_weight_proxy(
+    arrays: Sequence[np.ndarray],
+    component_names: Sequence[str],
+    capability_name: str,
+) -> Tuple[np.ndarray, pd.DataFrame]:
+    """Construct one [0,1] proxy using equal component weights.
+
+    Equal weighting is a deliberately non-informative aggregation rule at the
+    measurement layer: it does not assert empirically estimated relative
+    importance among the prespecified components. Cross-capability dependence
+    is estimated later by the data-driven ANP.
+    """
+    X = np.column_stack([np.asarray(a, dtype=float) for a in arrays])
+    if X.ndim != 2 or X.shape[1] != len(component_names):
+        raise ValueError(f"Equal-weight input shape mismatch for {capability_name}.")
+    if not np.isfinite(X).all():
+        raise ValueError(f"Non-finite values supplied to equal weighting for {capability_name}.")
+    m = X.shape[1]
+    if m < 1:
+        raise ValueError(f"No components supplied for {capability_name}.")
+    weights = np.full(m, 1.0 / m, dtype=float)
+    diagnostics = pd.DataFrame({
+        "capability": capability_name,
+        "component": list(component_names),
+        "method": "equal_weight",
+        "weight": weights,
+        "mean": np.mean(X, axis=0),
+        "std": np.std(X, axis=0),
+        "nonzero_count": np.sum(X > 0.0, axis=0).astype(int),
+        "n_models": int(X.shape[0]),
+    })
+    return np.clip(X @ weights, 0.0, 1.0), diagnostics
+
+
 def normalize_optional_score(df: pd.DataFrame, candidates: Sequence[str]) -> Tuple[Optional[np.ndarray], Optional[str]]:
     for c in candidates:
         if c not in df.columns:
@@ -312,8 +249,24 @@ def combine_optional_binary_flags(df: pd.DataFrame, candidates: Sequence[str]) -
     return np.max(np.vstack(cols), axis=0), present
 
 
-def build_continuous_capabilities(df: pd.DataFrame) -> CapabilityBuildResult:
-    """Construct the fixed empirical state x_t=[S,R,W,A]^T plus auxiliary reasoning measures."""
+def build_continuous_capabilities(
+    df: pd.DataFrame,
+) -> CapabilityBuildResult:
+    """Construct the de-nested equal-weight state x_t=[S,R,W,A]^T.
+
+    The primary measurement specification uses equal weighting within each
+    prespecified construct after robust [0,1] scaling of the three continuous
+    Scale inputs:
+
+        S = (P_scaled + C_scaled + D_scaled) / 3
+        R = (I_reason + I_code + I_chat) / 3
+        W = (I_multimodal + I_tool) / 2
+        A = (I_tool + I_agentic + I_reason + I_frontier) / 4
+
+    Direct standardized benchmark scores, if supplied in a future dataset, take
+    precedence over the corresponding proxy. No Scale->Reasoning or
+    Reasoning->World-interaction algebraic nesting is used.
+    """
     lp = robust_scale_01(df["log10_parameters"].to_numpy(float))
     lc = robust_scale_01(df["log10_training_compute_flop"].to_numpy(float))
     ld = robust_scale_01(df["log10_training_dataset_size_total"].to_numpy(float))
@@ -326,7 +279,14 @@ def build_continuous_capabilities(df: pd.DataFrame) -> CapabilityBuildResult:
     mm = df["multimodal_flag"].to_numpy(float)
     frontier = df["frontier_model_flag"].to_numpy(float)
 
-    scale = np.clip(0.45 * lp + 0.35 * lc + 0.20 * ld, 0.0, 1.0)
+    weight_tables: List[pd.DataFrame] = []
+
+    scale, wtab = construct_equal_weight_proxy(
+        [lp, lc, ld],
+        ["log10_parameters_scaled", "log10_training_compute_scaled", "log10_training_data_scaled"],
+        "Scale",
+    )
+    weight_tables.append(wtab)
 
     reasoning_direct, reasoning_source = normalize_optional_score(
         df, ["reasoning_score", "reasoning_benchmark_score"]
@@ -336,18 +296,22 @@ def build_continuous_capabilities(df: pd.DataFrame) -> CapabilityBuildResult:
         reasoning_mode = "direct"
         reasoning_note = f"Direct normalized score from {reasoning_source}."
     else:
-        reasoning = np.clip(
-            0.45 * reasoning_flag + 0.30 * code + 0.15 * chat + 0.10 * scale,
-            0.0, 1.0,
+        reasoning, wtab = construct_equal_weight_proxy(
+            [reasoning_flag, code, chat],
+            ["reasoning_flag", "code_flag", "chat_flag"],
+            "Reasoning",
         )
-        reasoning_mode = "proxy"
-        reasoning_note = "Proxy from reasoning/code/chat flags plus a small scale term."
+        weight_tables.append(wtab)
+        reasoning_mode = "proxy_equal_denested"
+        reasoning_note = (
+            "Equal-weight proxy from reasoning, code, and chat indicators; "
+            "Scale is not included in the Reasoning proxy."
+        )
 
     # ------------------------------------------------------------------
     # Auxiliary reasoning inspectability layer
     # ------------------------------------------------------------------
-    # Inspectability means that intermediate reasoning is externally observable or
-    # reportable. It is NOT synonymous with faithful explanation or mechanistic XAI.
+    # Inspectability remains auxiliary and is not part of S/R/W/A.
     inspect_direct, inspect_source = normalize_optional_score(
         df, [
             "reasoning_inspectability_score",
@@ -369,9 +333,14 @@ def build_continuous_capabilities(df: pd.DataFrame) -> CapabilityBuildResult:
     if inspect_direct is not None:
         reasoning_inspectability = inspect_direct
         inspect_mode = "direct"
-        inspect_note = f"Direct normalized reasoning-inspectability score from {inspect_source}; not a faithfulness score."
+        inspect_note = (
+            f"Direct normalized reasoning-inspectability score from {inspect_source}; "
+            "not a faithfulness score."
+        )
     elif trace_flag is not None:
-        reasoning_inspectability = np.clip(0.80 * trace_flag + 0.20 * reasoning_flag, 0.0, 1.0)
+        reasoning_inspectability = np.clip(
+            0.80 * trace_flag + 0.20 * reasoning_flag, 0.0, 1.0
+        )
         inspect_mode = "proxy_trace_flag"
         inspect_note = (
             "Partial-inspectability proxy from explicit reasoning-trace indicators "
@@ -383,9 +352,8 @@ def build_continuous_capabilities(df: pd.DataFrame) -> CapabilityBuildResult:
         )
         inspect_mode = "proxy_reasoning_flag"
         inspect_note = (
-            "Weak partial-inspectability proxy dominated by reasoning_flag, with small "
-            "chat/code terms. It indicates likely explicit reasoning behavior only; "
-            "it does not establish that a chain-of-thought was exposed or faithful."
+            "Weak auxiliary inspectability proxy dominated by reasoning_flag, with "
+            "small chat/code terms; excluded from the S/R/W/A state and ANP."
         )
 
     faith_direct, faith_source = normalize_optional_score(
@@ -401,7 +369,7 @@ def build_continuous_capabilities(df: pd.DataFrame) -> CapabilityBuildResult:
         faith_mode = "unmeasured"
         faith_note = (
             "No direct reasoning-faithfulness measure supplied. Faithfulness is never "
-            "inferred from chain-of-thought visibility, reasoning flags, or model scale."
+            "inferred from reasoning visibility or metadata flags."
         )
     else:
         reasoning_faithfulness = faith_direct
@@ -416,11 +384,16 @@ def build_continuous_capabilities(df: pd.DataFrame) -> CapabilityBuildResult:
         world_mode = "direct"
         world_note = f"Direct normalized score from {world_source}."
     else:
-        world = np.clip(0.55 * mm + 0.25 * tool + 0.20 * reasoning, 0.0, 1.0)
-        world_mode = "proxy"
+        world, wtab = construct_equal_weight_proxy(
+            [mm, tool],
+            ["multimodal_flag", "tool_use_flag"],
+            "World_Model",
+        )
+        weight_tables.append(wtab)
+        world_mode = "proxy_equal_denested"
         world_note = (
-            "World-interaction proxy from multimodality, tool use, and reasoning; "
-            "not a direct world-model benchmark."
+            "Equal-weight world-interaction proxy from multimodality and tool use; "
+            "Reasoning is not included and this is not a direct world-model benchmark."
         )
 
     agency_direct, agency_source = normalize_optional_score(
@@ -431,12 +404,16 @@ def build_continuous_capabilities(df: pd.DataFrame) -> CapabilityBuildResult:
         agency_mode = "direct"
         agency_note = f"Direct normalized score from {agency_source}."
     else:
-        agency = np.clip(
-            0.45 * tool + 0.30 * agent_flag + 0.15 * reasoning_flag + 0.10 * frontier,
-            0.0, 1.0,
+        agency, wtab = construct_equal_weight_proxy(
+            [tool, agent_flag, reasoning_flag, frontier],
+            ["tool_use_flag", "agentic_flag", "reasoning_flag", "frontier_model_flag"],
+            "Agency",
         )
-        agency_mode = "proxy"
-        agency_note = "Proxy from tool-use, agentic, reasoning and frontier indicators."
+        weight_tables.append(wtab)
+        agency_mode = "proxy_equal"
+        agency_note = (
+            "Equal-weight proxy from tool-use, agentic, reasoning, and frontier indicators."
+        )
 
     values = pd.DataFrame({
         "Scale": scale,
@@ -448,7 +425,7 @@ def build_continuous_capabilities(df: pd.DataFrame) -> CapabilityBuildResult:
     }, index=df.index)
 
     rows = [
-        ("Scale", "constructed_observable", "Parameters + training compute + training-data size."),
+        ("Scale", "constructed_equal", "Equal mean of robustly scaled log parameters, compute, and data size."),
         ("Reasoning", reasoning_mode, reasoning_note),
         ("Reasoning_Inspectability", inspect_mode, inspect_note),
         ("Reasoning_Faithfulness", faith_mode, faith_note),
@@ -456,21 +433,30 @@ def build_continuous_capabilities(df: pd.DataFrame) -> CapabilityBuildResult:
         ("Agency", agency_mode, agency_note),
     ]
     metadata = pd.DataFrame(rows, columns=["capability", "measurement_mode", "note"])
+    proxy_weights = pd.concat(weight_tables, ignore_index=True) if weight_tables else pd.DataFrame()
+    if not proxy_weights.empty:
+        proxy_weights.insert(0, "proxy_weighting", "equal")
 
-    # The empirical state is fixed by design to S, R, W, and A.
     active_names: List[str] = list(CAPABILITY_ORDER)
     for c in active_names:
         x = values[c].to_numpy(float)
         if not np.isfinite(x).all():
-            raise ValueError(f"Empirical capability {c} contains non-finite values; x_t must remain four-dimensional.")
+            raise ValueError(
+                f"Empirical capability {c} contains non-finite values; x_t must remain four-dimensional."
+            )
         if np.nanstd(x) <= 1e-10:
             warnings.warn(f"Empirical capability {c} is nearly constant in the supplied dataset.")
 
-    direct_inspectability = inspect_mode == "direct" and np.isfinite(reasoning_inspectability).mean() >= 0.80
-    direct_faithfulness = faith_mode == "direct" and np.isfinite(reasoning_faithfulness).mean() >= 0.80
+    direct_inspectability = (
+        inspect_mode == "direct" and np.isfinite(reasoning_inspectability).mean() >= 0.80
+    )
+    direct_faithfulness = (
+        faith_mode == "direct" and np.isfinite(reasoning_faithfulness).mean() >= 0.80
+    )
 
     return CapabilityBuildResult(
-        values, metadata, active_names, direct_inspectability, direct_faithfulness
+        values, metadata, proxy_weights, active_names,
+        direct_inspectability, direct_faithfulness
     )
 
 
@@ -603,15 +589,14 @@ def plot_reasoning_interpretability(aux: pd.DataFrame, outdir: Path) -> None:
     ax.set_xticklabels(aux["period"], rotation=45, ha="right")
     ax.set_ylim(0.0, 1.0)
     ax.set_ylabel("Normalized score / proxy")
-    ax.set_title("Reasoning capability and partial inspectability over time")
     ax.legend()
     ax.text(
         0.01, -0.24,
         "Inspectability indicates observable/reportable reasoning behavior; it is not a faithful XAI measure unless direct faithfulness data are supplied.",
-        transform=ax.transAxes, fontsize=8, va="top", wrap=True,
+        transform=ax.transAxes, fontsize=10, va="top", wrap=True,
     )
     fig.tight_layout()
-    fig.savefig(outdir / "reasoning_inspectability_evolution.png", dpi=180, bbox_inches="tight")
+    fig.savefig(outdir / "reasoning_inspectability_evolution.png", dpi=600, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1474,9 +1459,8 @@ def make_plots(
     ax.set_ylim(0, 1)
     ax.set_ylabel("Mean capability level")
     ax.set_xlabel("Period")
-    ax.set_title("Continuous LLM Capability Evolution")
-    ax.legend(fontsize=8)
-    fig.tight_layout(); fig.savefig(outdir / "continuous_capability_evolution.png", dpi=180); plt.close(fig)
+    ax.legend(fontsize=10)
+    fig.tight_layout(); fig.savefig(outdir / "continuous_capability_evolution.png", dpi=600); plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.bar(np.arange(len(active_names)), equilibrium)
@@ -1484,8 +1468,7 @@ def make_plots(
     ax.set_xticklabels(active_names, rotation=30, ha="right")
     ax.set_ylim(0, 1)
     ax.set_ylabel("Conditional equilibrium capability")
-    ax.set_title("Conditional Capability Equilibrium under Final Regime Conditions")
-    fig.tight_layout(); fig.savefig(outdir / "capability_conditional_equilibrium.png", dpi=180); plt.close(fig)
+    fig.tight_layout(); fig.savefig(outdir / "capability_conditional_equilibrium.png", dpi=600); plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(11, 6))
     x = np.arange(len(regime_agg))
@@ -1496,19 +1479,17 @@ def make_plots(
     ax.set_ylim(0, 1)
     ax.set_ylabel("Share of models in exclusive regime")
     ax.set_xlabel("Period")
-    ax.set_title("Technological-Regime Distribution")
-    ax.legend(fontsize=8)
-    fig.tight_layout(); fig.savefig(outdir / "regime_distribution_evolution.png", dpi=180); plt.close(fig)
+    ax.legend(fontsize=10)
+    fig.tight_layout(); fig.savefig(outdir / "regime_distribution_evolution.png", dpi=600); plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(8, 7))
     im = ax.imshow(P_final, aspect="auto")
     ax.set_xticks(np.arange(len(REGIME_NAMES))); ax.set_yticks(np.arange(len(REGIME_NAMES)))
-    ax.set_xticklabels(REGIME_NAMES, rotation=45, ha="right", fontsize=8)
-    ax.set_yticklabels(REGIME_NAMES, fontsize=8)
+    ax.set_xticklabels(REGIME_NAMES, rotation=45, ha="right", fontsize=10)
+    ax.set_yticklabels(REGIME_NAMES, fontsize=10)
     ax.set_xlabel("Destination regime"); ax.set_ylabel("Source regime")
-    ax.set_title("Final Non-homogeneous Regime Transition Matrix")
     fig.colorbar(im, ax=ax, label="Transition probability")
-    fig.tight_layout(); fig.savefig(outdir / "regime_final_transition_matrix.png", dpi=180); plt.close(fig)
+    fig.tight_layout(); fig.savefig(outdir / "regime_final_transition_matrix.png", dpi=600); plt.close(fig)
 
     if len(break_table):
         bt = break_table.sort_values("break_transition_index")
@@ -1519,8 +1500,7 @@ def make_plots(
         ax.set_xticklabels(bt["break_after_period"], rotation=45, ha="right")
         ax.set_ylabel("Delta BIC: two-regime minus homogeneous")
         ax.set_xlabel("Candidate break after period")
-        ax.set_title("Structural-Break Diagnostic")
-        fig.tight_layout(); fig.savefig(outdir / "structural_break_bic.png", dpi=180); plt.close(fig)
+        fig.tight_layout(); fig.savefig(outdir / "structural_break_bic.png", dpi=600); plt.close(fig)
 
 
 def make_manuscript_validation_plots(
@@ -1548,12 +1528,11 @@ def make_manuscript_validation_plots(
         bars = ax.bar(x, vals)
         ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha="right")
         ax.set_ylabel("One-step RMSE")
-        ax.set_title("ANP ablation: predictive error")
         upper = max(vals) * 1.22 if len(vals) else 1.0
         ax.set_ylim(0.0, upper)
         for b, v in zip(bars, vals):
             ax.text(b.get_x()+b.get_width()/2, v + upper*0.015, f"{v:.3f}", ha="center", va="bottom")
-        fig.tight_layout(); fig.savefig(outdir / "anp_ablation_rmse.png", dpi=180); plt.close(fig)
+        fig.tight_layout(); fig.savefig(outdir / "anp_ablation_rmse.png", dpi=600); plt.close(fig)
 
     # Figure 3: homogeneous, time-varying, and state-dependent Markov comparison.
     if not markov_comp.empty:
@@ -1566,12 +1545,11 @@ def make_manuscript_validation_plots(
         bars = ax.bar(x, vals)
         ax.set_xticks(x); ax.set_xticklabels(labels)
         ax.set_ylabel("One-step RMSE")
-        ax.set_title("Technological-regime Markov model comparison")
         upper = max(vals) * 1.20 if len(vals) else 1.0
         ax.set_ylim(0.0, upper)
         for b, v in zip(bars, vals):
             ax.text(b.get_x()+b.get_width()/2, v + upper*0.015, f"{v:.3f}", ha="center", va="bottom")
-        fig.tight_layout(); fig.savefig(outdir / "markov_baseline_rmse.png", dpi=180); plt.close(fig)
+        fig.tight_layout(); fig.savefig(outdir / "markov_baseline_rmse.png", dpi=600); plt.close(fig)
 
     # Figure 7: structural-break sensitivity across prespecified specifications.
     sensitivity_rows = []
@@ -1605,8 +1583,7 @@ def make_manuscript_validation_plots(
         ax.set_yticks(y); ax.set_yticklabels(labels)
         ax.axvline(0.0, linewidth=1)
         ax.set_xlabel(r"$\Delta$ pseudo-BIC (two-segment minus homogeneous)")
-        ax.set_title("Structural-break sensitivity across specifications")
-        fig.tight_layout(); fig.savefig(outdir / "break_robustness_sensitivity.png", dpi=180); plt.close(fig)
+        fig.tight_layout(); fig.savefig(outdir / "break_robustness_sensitivity.png", dpi=600); plt.close(fig)
 
     # Figure 8: fixed-candidate bootstrap distribution.
     if not boot.empty:
@@ -1618,8 +1595,7 @@ def make_manuscript_validation_plots(
             ax.axvline(0.0, linewidth=1)
             ax.set_xlabel(r"Bootstrap $\Delta$ pseudo-BIC")
             ax.set_ylabel("Frequency")
-            ax.set_title("Bootstrap support for the 2025Q3 candidate break")
-            fig.tight_layout(); fig.savefig(outdir / "break_bootstrap_delta_bic.png", dpi=180); plt.close(fig)
+            fig.tight_layout(); fig.savefig(outdir / "break_bootstrap_delta_bic.png", dpi=600); plt.close(fig)
 
 
 # -----------------------------------------------------------------------------
@@ -1646,6 +1622,7 @@ def main() -> None:
     cap_out = df[["model", "publication_date", "year"]].join(cap.values)
     cap_out.to_csv(outdir / "model_continuous_capabilities.csv", index=False, encoding="utf-8-sig")
     cap.metadata.to_csv(outdir / "capability_measurement_metadata.csv", index=False, encoding="utf-8-sig")
+    cap.proxy_weights.to_csv(outdir / "proxy_construction_weights.csv", index=False, encoding="utf-8-sig")
     inspect_cols = [
         "Reasoning", "Reasoning_Inspectability", "Reasoning_Faithfulness"
     ]
@@ -1653,6 +1630,11 @@ def main() -> None:
         outdir / "model_reasoning_inspectability.csv", index=False, encoding="utf-8-sig"
     )
     print(f"      active capabilities: {', '.join(cap.active_names)}")
+    print("      proxy weighting: equal (fully de-nested SRWA)")
+    if not cap.proxy_weights.empty:
+        for capability_name, g in cap.proxy_weights.groupby("capability", sort=False):
+            desc = ", ".join(f"{r.component}={r.weight:.4f}" for r in g.itertuples())
+            print(f"      {capability_name} weights: {desc}")
     print(f"      reasoning inspectability directly measured: {cap.direct_reasoning_inspectability_available}")
     print(f"      reasoning faithfulness directly measured: {cap.direct_reasoning_faithfulness_available}")
 
@@ -1747,6 +1729,8 @@ def main() -> None:
     )
     markov_comp.to_csv(outdir / "markov_baseline_comparison.csv", index=False, encoding="utf-8-sig")
 
+    denested_summary = pd.DataFrame(); denested_detail: Dict[str, object] = {}
+
     print("[10/12] Testing structural break in regime-transition dynamics")
     break_table, break_summary = structural_break_test(regime_fit)
     break_table.to_csv(outdir / "structural_break_test.csv", index=False, encoding="utf-8-sig")
@@ -1817,6 +1801,8 @@ def main() -> None:
         },
         "measurement": {
             "active_capabilities": cap.active_names,
+            "proxy_weighting": "equal_de_nested",
+            "proxy_construction_weights": cap.proxy_weights.to_dict(orient="records"),
             "reasoning_inspectability_directly_measured": bool(cap.direct_reasoning_inspectability_available),
             "reasoning_faithfulness_directly_measured": bool(cap.direct_reasoning_faithfulness_available),
             "reasoning_inspectability_used_in_core_dynamics": False,
@@ -1824,9 +1810,7 @@ def main() -> None:
             "regime_model_counts": {r: int(counts[r]) for r in REGIME_NAMES},
             "warning": (
                 "Reasoning inspectability is an auxiliary observable/proxy and is not a faithful explanation measure. "
-                "Visible or verbalized reasoning must not be equated with mechanistic XAI. "
-                "Persistent computational individuality is outside the three-regime empirical Markov state space. "
-                "The present analysis therefore estimates no persistent-individuality state or persistent-individuality transition probability; this is an identification boundary, not an impossibility claim."
+                "Visible or verbalized reasoning must not be equated with mechanistic XAI."
             ),
         },
         "capability_dynamics": cap_diag,
@@ -1841,6 +1825,7 @@ def main() -> None:
             "aggregation_break_sensitivity": aggregation_sens.to_dict(orient="records"),
             "provenance_break_sensitivity": provenance_sens.to_dict(orient="records"),
             "manuscript_ready_summary": reviewer_summary.to_dict(orient="records"),
+            "denested_proxy_robustness": denested_summary.to_dict(orient="records"),
         },
         "structural_break": break_summary,
         "verification": checks,
@@ -1877,6 +1862,10 @@ def main() -> None:
 
     print("\nReviewer validation: Why nonlinear/non-homogeneous Markov?")
     print(markov_comp.to_string(index=False))
+
+    if len(denested_summary):
+        print("\nReviewer robustness: de-nested capability proxies (baseline regime labels fixed)")
+        print(denested_summary.to_string(index=False))
 
     print("\nReviewer-ready conclusions")
     print(reviewer_summary.to_string(index=False))
