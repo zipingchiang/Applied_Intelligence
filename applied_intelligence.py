@@ -393,7 +393,7 @@ def build_continuous_capabilities(
         world_mode = "proxy_equal_denested"
         world_note = (
             "Equal-weight world-interaction proxy from multimodality and tool use; "
-            "Reasoning is not included and this is not a direct world-model benchmark."
+            "Reasoning is not included and this is not a direct World-Interaction benchmark."
         )
 
     agency_direct, agency_source = normalize_optional_score(
@@ -901,7 +901,7 @@ def assign_regimes(
         )
 
         if r3:
-            labels.append(REGIME_NAMES[2]); reasons.append("world-model/interaction and agency threshold")
+            labels.append(REGIME_NAMES[2]); reasons.append("World-Interaction/Agentic and agency threshold")
         elif r2:
             labels.append(REGIME_NAMES[1]); reasons.append("reasoning-centered threshold")
         else:
