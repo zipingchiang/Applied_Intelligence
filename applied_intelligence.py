@@ -65,8 +65,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "Continuous nonlinear capability dynamics + data-driven ANP + "
-            "technological-regime Markov model for LLM evolution, with an auxiliary "
-            "reasoning-inspectability layer that is explicitly separated from XAI faithfulness."
+            "technological-regime Markov model for LLM evolution, including a direct "
+            "scale-only versus full-capability state-dependent comparison for the "
+            "scaling-sufficiency question, expanding-window rolling-origin validation, "
+            "with reasoning inspectability explicitly "
+            "separated from XAI faithfulness."
         )
     )
     p.add_argument("--csv", type=str, default=None, help="Path to completed LLM CSV.")
@@ -98,6 +101,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--skip-publication-robustness", action="store_true",
         help="Skip threshold, temporal-aggregation, and provenance-restricted break sensitivity analyses."
+    )
+    p.add_argument(
+        "--rolling-origin-min-periods", type=int, default=16,
+        help=(
+            "Minimum number of complete periods in the first expanding-window training set "
+            "for rolling-origin one-step out-of-sample validation. Default: 16."
+        ),
+    )
+    p.add_argument(
+        "--rolling-origin-starts", type=int, default=2,
+        help=(
+            "Multistart initializations used inside each rolling-origin refit. "
+            "Default: 2 to keep the expanding-window validation computationally practical."
+        ),
+    )
+    p.add_argument(
+        "--skip-rolling-origin", action="store_true",
+        help="Skip expanding-window rolling-origin one-step out-of-sample validation.",
     )
     return p.parse_args()
 
@@ -596,7 +617,7 @@ def plot_reasoning_interpretability(aux: pd.DataFrame, outdir: Path) -> None:
         transform=ax.transAxes, fontsize=10, va="top", wrap=True,
     )
     fig.tight_layout()
-    fig.savefig(outdir / "reasoning_inspectability_evolution.png", dpi=600, bbox_inches="tight")
+    fig.savefig(outdir / "reasoning_inspectability_evolution.png", dpi=1000, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -641,6 +662,7 @@ def fit_capability_dynamics(
     ridge: float,
     starts: int,
     seed: int,
+    tau_values: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, float], pd.DataFrame]:
     names = list(active_names)
     X = agg[names].to_numpy(float)
@@ -648,7 +670,12 @@ def fit_capability_dynamics(
     T = len(X)
     if T < 5:
         raise ValueError("At least five complete time periods are required for nonlinear capability dynamics.")
-    taus = np.linspace(0.0, 1.0, T)
+    if tau_values is None:
+        taus = np.linspace(0.0, 1.0, T)
+    else:
+        taus = np.asarray(tau_values, dtype=float)
+        if len(taus) != T:
+            raise ValueError("tau_values length must equal the number of capability periods.")
     n = agg["n_models"].to_numpy(float)
     trans_w = np.sqrt(n[:-1] * n[1:])
     trans_w = trans_w / max(np.mean(trans_w), 1e-12)
@@ -743,12 +770,18 @@ def fit_capability_no_network(
     ridge: float,
     starts: int,
     seed: int,
+    tau_values: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, float], pd.DataFrame]:
     """Fit the reduced no-ANP/no-network capability baseline."""
     names = list(active_names)
     X = agg[names].to_numpy(float)
     d = len(names); T = len(X)
-    taus = np.linspace(0.0, 1.0, T)
+    if tau_values is None:
+        taus = np.linspace(0.0, 1.0, T)
+    else:
+        taus = np.asarray(tau_values, dtype=float)
+        if len(taus) != T:
+            raise ValueError("tau_values length must equal the number of capability periods.")
     n = agg["n_models"].to_numpy(float)
     trans_w = np.sqrt(n[:-1] * n[1:])
     trans_w = trans_w / max(np.mean(trans_w), 1e-12)
@@ -1006,6 +1039,8 @@ def fit_regime_markov(
     ridge: float,
     starts: int,
     seed: int,
+    readiness_label: str = "ANP-weighted full-capability readiness score",
+    tau_values: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, float], pd.DataFrame, pd.DataFrame]:
     merged = regime_agg.merge(capability_agg, on=["period", "n_models"], how="inner")
     q = merged[REGIME_NAMES].to_numpy(float)
@@ -1013,7 +1048,12 @@ def fit_regime_markov(
     T = len(q); d = len(active_names); k = len(REGIME_NAMES)
     if T < 5:
         raise ValueError("At least five complete time periods are required for regime Markov fitting.")
-    taus = np.linspace(0.0, 1.0, T)
+    if tau_values is None:
+        taus = np.linspace(0.0, 1.0, T)
+    else:
+        taus = np.asarray(tau_values, dtype=float)
+        if len(taus) != T:
+            raise ValueError("tau_values length must equal the number of regime periods.")
     n = merged["n_models"].to_numpy(float)
     wobs = np.sqrt(n[:-1] * n[1:])
     wobs = wobs / max(np.mean(wobs), 1e-12)
@@ -1063,7 +1103,7 @@ def fit_regime_markov(
         "sse_one_step":sse,"n_observations":nobs,"effective_parameters":int(k_eff),
         "pseudo_bic":float(nobs*math.log(max(sse/nobs,1e-15))+k_eff*math.log(nobs)),
         "n_periods":int(T),"n_transitions":int(T-1),"n_parameters":int(pcount),
-        "markov_capability_parameterization":"ANP-weighted architectural readiness score",
+        "markov_capability_parameterization": str(readiness_label),
     }
     return theta, diagnostics, pd.DataFrame(preds), pd.DataFrame(trans_long)
 
@@ -1117,20 +1157,174 @@ def fit_simple_regime_baseline(regime_agg: pd.DataFrame, mode: str, ridge: float
             "optimizer_success":bool(best.success)}
 
 
-def regime_model_comparison(regime_agg: pd.DataFrame, full_diag: Dict[str,float], active_names: Sequence[str], ridge: float, starts: int, seed: int) -> pd.DataFrame:
-    q=regime_agg[REGIME_NAMES].to_numpy(float); nobs=(len(q)-1)*len(REGIME_NAMES)
-    full_sse=float(full_diag.get("sse_one_step", full_diag["rmse_one_step"]**2*nobs))
-    full_keff=int(full_diag.get("effective_parameters", 3*(len(REGIME_NAMES)-1)+2))
-    full_bic=float(full_diag.get("pseudo_bic", nobs*math.log(max(full_sse/nobs,1e-15))+full_keff*math.log(nobs)))
-    rows=[fit_simple_regime_baseline(regime_agg,"homogeneous",ridge,starts,seed),
-          fit_simple_regime_baseline(regime_agg,"time_varying",ridge,starts,seed),
-          {"model":"full_state_dependent_nonlinear","rmse":float(full_diag["rmse_one_step"]),
-           "mae":float(full_diag["mae_one_step"]),"sse":full_sse,"effective_parameters":int(full_keff),
-           "pseudo_bic":full_bic,"optimizer_success":bool(full_diag.get("optimizer_success",True))}]
-    df=pd.DataFrame(rows)
-    h=float(df.loc[df.model=="homogeneous","rmse"].iloc[0])
-    df["rmse_improvement_vs_homogeneous_pct"]=100.0*(h-df["rmse"])/max(h,1e-15)
+def regime_model_comparison(
+    regime_agg: pd.DataFrame,
+    full_diag: Dict[str,float],
+    scale_only_diag: Dict[str,float],
+    ridge: float,
+    starts: int,
+    seed: int,
+) -> pd.DataFrame:
+    """Compare four regime models used by the manuscript.
+
+    The scale-only and full-capability state-dependent specifications have the
+    same functional form and nominal free-parameter count. Their only
+    difference is the readiness input:
+
+        scale-only:     r_t^(S) = S_t
+        full-capability: r_t = w_ANP^T x_t
+
+    This supplies the direct scaling-sufficiency comparison required by the
+    revised research question.
+    """
+    q = regime_agg[REGIME_NAMES].to_numpy(float)
+    nobs = (len(q)-1) * len(REGIME_NAMES)
+
+    def row_from_diag(model: str, diag: Dict[str, float]) -> Dict[str, object]:
+        sse = float(diag.get("sse_one_step", diag["rmse_one_step"]**2 * nobs))
+        keff = int(diag.get("effective_parameters", 3*(len(REGIME_NAMES)-1)+2))
+        bic = float(diag.get(
+            "pseudo_bic",
+            nobs * math.log(max(sse/nobs, 1e-15)) + keff * math.log(nobs),
+        ))
+        return {
+            "model": model,
+            "rmse": float(diag["rmse_one_step"]),
+            "mae": float(diag["mae_one_step"]),
+            "sse": sse,
+            "effective_parameters": keff,
+            "pseudo_bic": bic,
+            "optimizer_success": bool(diag.get("optimizer_success", True)),
+        }
+
+    rows = [
+        fit_simple_regime_baseline(regime_agg, "homogeneous", ridge, starts, seed),
+        fit_simple_regime_baseline(regime_agg, "time_varying", ridge, starts, seed),
+        row_from_diag("scale_only_state_dependent", scale_only_diag),
+        row_from_diag("full_state_dependent_nonlinear", full_diag),
+    ]
+    df = pd.DataFrame(rows)
+
+    h = float(df.loc[df.model=="homogeneous", "rmse"].iloc[0])
+    s = float(df.loc[df.model=="scale_only_state_dependent", "rmse"].iloc[0])
+    df["rmse_improvement_vs_homogeneous_pct"] = 100.0 * (h-df["rmse"]) / max(h, 1e-15)
+    df["rmse_improvement_vs_scale_only_pct"] = 100.0 * (s-df["rmse"]) / max(s, 1e-15)
     return df
+
+
+
+# -----------------------------------------------------------------------------
+# Expanding-window rolling-origin one-step temporal validation
+# -----------------------------------------------------------------------------
+
+def _rolling_summary(detail: pd.DataFrame, group_col: str = "model") -> pd.DataFrame:
+    """Aggregate held-out one-step rolling-origin errors across test periods."""
+    if detail.empty:
+        return pd.DataFrame(columns=[group_col, "n_test_periods", "n_scalar_errors", "rmse_out_of_sample", "mae_out_of_sample"])
+    rows=[]
+    for name,g in detail.groupby(group_col,sort=False):
+        err_cols=[c for c in g.columns if c.startswith("error_")]
+        if not err_cols: continue
+        E=g[err_cols].to_numpy(float)
+        rows.append({group_col:name,"n_test_periods":int(len(g)),"n_scalar_errors":int(E.size),
+                     "rmse_out_of_sample":float(np.sqrt(np.mean(E**2))),
+                     "mae_out_of_sample":float(np.mean(np.abs(E)))})
+    return pd.DataFrame(rows)
+
+
+def rolling_origin_temporal_validation(
+    df: pd.DataFrame,
+    capability: CapabilityBuildResult,
+    capability_fit: pd.DataFrame,
+    regime_fit: pd.DataFrame,
+    period: str,
+    anp_self_loop: float,
+    ridge_capability: float,
+    ridge_regime: float,
+    starts: int,
+    seed: int,
+    min_train_periods: int = 16,
+) -> Tuple[pd.DataFrame,pd.DataFrame,pd.DataFrame,pd.DataFrame]:
+    """Expanding-window one-step temporal validation.
+
+    Existing manuscript metrics remain explicitly in-sample reconstruction metrics.
+    For each origin this routine fits on periods through t and forecasts held-out t+1.
+    The ANP network is re-estimated from model records in the training periods only.
+    Operational proxy scaling is kept frozen so all origins remain on a common scale;
+    therefore this is temporal generalization conditional on the frozen measurement
+    construction rather than a fully nested measurement-reestimation experiment.
+    """
+    cap_names=list(capability.active_names)
+    T=len(capability_fit)
+    if len(regime_fit)!=T: raise ValueError("Capability and regime fitted-period tables must have the same length.")
+    min_train=max(5,int(min_train_periods))
+    if min_train>=T: raise ValueError(f"rolling-origin-min-periods={min_train} must be smaller than fitted periods={T}.")
+    ro_starts=max(1,int(starts))
+    global_tau=np.linspace(0.0,1.0,T)
+    model_period=period_labels(df,period).astype(str)
+    fitted_periods=capability_fit["period"].astype(str).tolist()
+    scale_weights=np.zeros(len(cap_names),dtype=float)
+    if "Scale" not in cap_names: raise ValueError("Scale capability is required for rolling-origin validation.")
+    scale_weights[cap_names.index("Scale")]=1.0
+    cap_rows=[]; markov_rows=[]
+
+    for test_idx in range(min_train,T):
+        cap_train=capability_fit.iloc[:test_idx].reset_index(drop=True)
+        reg_train=regime_fit.iloc[:test_idx].reset_index(drop=True)
+        train_labels=set(fitted_periods[:test_idx])
+        train_mask=model_period.isin(train_labels).to_numpy()
+        train_model_caps=capability.values.loc[train_mask,cap_names].reset_index(drop=True)
+        _,_,Wlim_train,cross_train=build_empirical_anp(train_model_caps,cap_names,anp_self_loop,seed+test_idx)
+        weights_train=Wlim_train.mean(axis=1); weights_train=weights_train/max(weights_train.sum(),1e-15)
+        tau_train=global_tau[:test_idx]; tau_source=float(global_tau[test_idx-1])
+
+        full_theta,_,_=fit_capability_dynamics(cap_train,cap_names,cross_train,ridge_capability,ro_starts,seed+10000+test_idx,tau_values=tau_train)
+        base_theta,_,_=fit_capability_no_network(cap_train,cap_names,ridge_capability,ro_starts,seed+20000+test_idx,tau_values=tau_train)
+        x_source=capability_fit.loc[test_idx-1,cap_names].to_numpy(float)
+        x_target=capability_fit.loc[test_idx,cap_names].to_numpy(float)
+        for model_name,pred in [
+            ("Full_ANP_nonlinear",capability_map(x_source,tau_source,full_theta,cross_train)),
+            ("No_ANP_network_baseline",capability_map_no_network(x_source,tau_source,base_theta)),
+        ]:
+            row={"model":model_name,"train_start_period":fitted_periods[0],"train_end_period":fitted_periods[test_idx-1],
+                 "test_period":fitted_periods[test_idx],"n_train_periods":int(test_idx),"n_train_transitions":int(test_idx-1),
+                 "tau_source":tau_source,"measurement_scaling":"frozen_full_sample_proxy_scale",
+                 "anp_estimation":"training_period_model_records_only"}
+            for j,c in enumerate(cap_names):
+                row[f"observed_{c}"]=float(x_target[j]); row[f"predicted_{c}"]=float(pred[j]); row[f"error_{c}"]=float(pred[j]-x_target[j])
+            cap_rows.append(row)
+
+        full_reg_theta,_,_,_=fit_regime_markov(reg_train,cap_train,cap_names,weights_train,ridge_regime,ro_starts,seed+30000+test_idx,
+                                               readiness_label="rolling-origin full-capability readiness",tau_values=tau_train)
+        scale_reg_theta,_,_,_=fit_regime_markov(reg_train,cap_train,cap_names,scale_weights,ridge_regime,ro_starts,seed+40000+test_idx,
+                                                readiness_label="rolling-origin scale-only readiness",tau_values=tau_train)
+        q_source=regime_fit.loc[test_idx-1,REGIME_NAMES].to_numpy(float); q_target=regime_fit.loc[test_idx,REGIME_NAMES].to_numpy(float)
+        x_source_m=capability_fit.loc[test_idx-1,cap_names].to_numpy(float)
+        pred_full=q_source@regime_transition_matrix(q_source,x_source_m,tau_source,full_reg_theta,weights_train)
+        pred_scale=q_source@regime_transition_matrix(q_source,x_source_m,tau_source,scale_reg_theta,scale_weights)
+        for model_name,pred in [("scale_only_state_dependent",pred_scale),("full_state_dependent_nonlinear",pred_full)]:
+            row={"model":model_name,"train_start_period":fitted_periods[0],"train_end_period":fitted_periods[test_idx-1],
+                 "test_period":fitted_periods[test_idx],"n_train_periods":int(test_idx),"n_train_transitions":int(test_idx-1),
+                 "tau_source":tau_source,"measurement_scaling":"frozen_full_sample_proxy_scale",
+                 "anp_estimation":"not_used_scale_only" if model_name=="scale_only_state_dependent" else "training_period_model_records_only"}
+            for j,r in enumerate(REGIME_NAMES):
+                row[f"observed_{r}"]=float(q_target[j]); row[f"predicted_{r}"]=float(pred[j]); row[f"error_{r}"]=float(pred[j]-q_target[j])
+            markov_rows.append(row)
+
+    cap_detail=pd.DataFrame(cap_rows); markov_detail=pd.DataFrame(markov_rows)
+    cap_summary=_rolling_summary(cap_detail); markov_summary=_rolling_summary(markov_detail)
+    if not cap_summary.empty:
+        hit=cap_summary.loc[cap_summary.model=="No_ANP_network_baseline"]
+        if len(hit):
+            b=float(hit.iloc[0].rmse_out_of_sample)
+            cap_summary["rmse_improvement_vs_no_anp_pct"]=100.0*(b-cap_summary.rmse_out_of_sample)/max(b,1e-15)
+    if not markov_summary.empty:
+        hit=markov_summary.loc[markov_summary.model=="scale_only_state_dependent"]
+        if len(hit):
+            s=float(hit.iloc[0].rmse_out_of_sample)
+            markov_summary["rmse_improvement_vs_scale_only_pct"]=100.0*(s-markov_summary.rmse_out_of_sample)/max(s,1e-15)
+    return cap_detail,cap_summary,markov_detail,markov_summary
+
 
 # -----------------------------------------------------------------------------
 # Reduced homogeneous Markov model for structural-break testing
@@ -1366,49 +1560,115 @@ def reviewer_validation_summary(
     anp_comp: pd.DataFrame, markov_comp: pd.DataFrame, break_summary: Dict[str,object],
     threshold_sens: pd.DataFrame, aggregation_sens: pd.DataFrame, provenance_sens: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Create manuscript-ready answers to the three likely reviewer questions."""
-    fulla=anp_comp.loc[anp_comp["model"]=="Full_ANP_nonlinear"].iloc[0]
-    basea=anp_comp.loc[anp_comp["model"]=="No_ANP_network_baseline"].iloc[0]
-    anp_supported=bool(fulla["rmse"]<basea["rmse"] and fulla["pseudo_bic"]<basea["pseudo_bic"])
+    """Create manuscript-ready answers to the main reviewer questions."""
+    fulla = anp_comp.loc[anp_comp["model"]=="Full_ANP_nonlinear"].iloc[0]
+    basea = anp_comp.loc[anp_comp["model"]=="No_ANP_network_baseline"].iloc[0]
+    anp_supported = bool(
+        fulla["rmse"] < basea["rmse"] and fulla["pseudo_bic"] < basea["pseudo_bic"]
+    )
 
-    fullm=markov_comp.loc[markov_comp["model"]=="full_state_dependent_nonlinear"].iloc[0]
-    basem=markov_comp.loc[markov_comp["model"]=="homogeneous"].iloc[0]
-    markov_supported=bool(fullm["rmse"]<basem["rmse"] and fullm["pseudo_bic"]<basem["pseudo_bic"])
+    fullm = markov_comp.loc[
+        markov_comp["model"]=="full_state_dependent_nonlinear"
+    ].iloc[0]
+    scalem = markov_comp.loc[
+        markov_comp["model"]=="scale_only_state_dependent"
+    ].iloc[0]
+    basem = markov_comp.loc[markov_comp["model"]=="homogeneous"].iloc[0]
+    timem = markov_comp.loc[markov_comp["model"]=="time_varying"].iloc[0]
 
-    baseline=str(break_summary.get("best_break_after_period","")); bidx=_quarter_index(baseline)
-    thresh_stable=None
+    scale_only_insufficient = bool(
+        fullm["rmse"] < scalem["rmse"] and fullm["pseudo_bic"] < scalem["pseudo_bic"]
+    )
+    markov_supported = bool(
+        fullm["rmse"] < basem["rmse"] and fullm["pseudo_bic"] < basem["pseudo_bic"]
+    )
+    capability_state_beyond_time = bool(
+        fullm["rmse"] < timem["rmse"] and fullm["pseudo_bic"] < timem["pseudo_bic"]
+    )
+
+    baseline = str(break_summary.get("best_break_after_period",""))
+    bidx = _quarter_index(baseline)
+
+    thresh_stable = None
     if bidx is not None and not threshold_sens.empty:
-        inds=threshold_sens["best_break_after_period"].map(_quarter_index)
-        valid=inds.dropna()
-        thresh_stable=bool(len(valid)>0 and np.all(np.abs(valid.to_numpy(float)-bidx)<=1))
+        inds = threshold_sens["best_break_after_period"].map(_quarter_index)
+        valid = inds.dropna()
+        thresh_stable = bool(
+            len(valid) > 0 and np.all(np.abs(valid.to_numpy(float)-bidx) <= 1)
+        )
 
-    prov_stable=None
+    prov_stable = None
     if bidx is not None and not provenance_sens.empty:
-        other=provenance_sens[provenance_sens["analysis"]!="full"]
-        inds=other["best_break_after_period"].map(_quarter_index).dropna()
-        prov_stable=bool(len(inds)>0 and np.all(np.abs(inds.to_numpy(float)-bidx)<=1))
+        other = provenance_sens[provenance_sens["analysis"]!="full"]
+        inds = other["best_break_after_period"].map(_quarter_index).dropna()
+        prov_stable = bool(
+            len(inds) > 0 and np.all(np.abs(inds.to_numpy(float)-bidx) <= 1)
+        )
 
-    boot_n=int(break_summary.get("bootstrap_replicates",0) or 0)
-    boot_support=None
-    if boot_n>0:
-        boot_support=bool(float(break_summary.get("bootstrap_fraction_delta_bic_lt_0",0))>=0.80)
+    boot_n = int(break_summary.get("bootstrap_replicates",0) or 0)
+    boot_support = None
+    if boot_n > 0:
+        boot_support = bool(
+            float(break_summary.get("bootstrap_fraction_delta_bic_lt_0",0)) >= 0.80
+        )
 
-    overall_break_robust=bool(thresh_stable is True and prov_stable is True and boot_support is True)
-    if boot_n==0:
-        break_status="not_confirmed_bootstrap_not_run"
+    overall_break_robust = bool(
+        thresh_stable is True and prov_stable is True and boot_support is True
+    )
+    if boot_n == 0:
+        break_status = "not_confirmed_bootstrap_not_run"
     elif overall_break_robust:
-        break_status="robust_under_prespecified_checks"
+        break_status = "robust_under_prespecified_checks"
     else:
-        break_status="exploratory_not_robustly_confirmed"
+        break_status = "exploratory_not_robustly_confirmed"
+
+    scale_gain = 100.0 * (
+        float(scalem["rmse"]) - float(fullm["rmse"])
+    ) / max(float(scalem["rmse"]), 1e-15)
 
     return pd.DataFrame([
-        {"reviewer_question":"Why ANP?","status":"supported" if anp_supported else "not_supported",
-         "evidence":f"RMSE {fulla['rmse']:.6f} vs {basea['rmse']:.6f}; pseudo-BIC {fulla['pseudo_bic']:.3f} vs {basea['pseudo_bic']:.3f}."},
-        {"reviewer_question":"Why nonlinear/non-homogeneous Markov?","status":"supported" if markov_supported else "not_supported",
-         "evidence":f"Full RMSE {fullm['rmse']:.6f} vs homogeneous {basem['rmse']:.6f}; pseudo-BIC {fullm['pseudo_bic']:.3f} vs {basem['pseudo_bic']:.3f}."},
-        {"reviewer_question":"Is the candidate break robust?","status":break_status,
-         "evidence":f"Observed best break={baseline}; threshold_within_1_period={thresh_stable}; provenance_within_1_period={prov_stable}; bootstrap_support={boot_support}; bootstrap_n={boot_n}."},
+        {
+            "reviewer_question": "Why ANP?",
+            "status": "supported" if anp_supported else "not_supported",
+            "evidence": (
+                f"RMSE {fulla['rmse']:.6f} vs {basea['rmse']:.6f}; "
+                f"pseudo-BIC {fulla['pseudo_bic']:.3f} vs {basea['pseudo_bic']:.3f}."
+            ),
+        },
+        {
+            "reviewer_question": "Is scale alone sufficient for observed regime dynamics?",
+            "status": (
+                "full_capability_state_supported_over_scale_only"
+                if scale_only_insufficient else
+                "scale_only_not_outperformed"
+            ),
+            "evidence": (
+                f"Full-capability RMSE {fullm['rmse']:.6f} vs scale-only "
+                f"{scalem['rmse']:.6f}; RMSE gain={scale_gain:.2f}%; "
+                f"pseudo-BIC {fullm['pseudo_bic']:.3f} vs {scalem['pseudo_bic']:.3f}. "
+                "Interpretation is restricted to the observable three-regime state space."
+            ),
+        },
+        {
+            "reviewer_question": "Why nonlinear/non-homogeneous Markov?",
+            "status": "supported" if markov_supported else "not_supported",
+            "evidence": (
+                f"Full RMSE {fullm['rmse']:.6f} vs homogeneous {basem['rmse']:.6f}; "
+                f"pseudo-BIC {fullm['pseudo_bic']:.3f} vs {basem['pseudo_bic']:.3f}; "
+                f"full also outperforms calendar-time-only={capability_state_beyond_time}."
+            ),
+        },
+        {
+            "reviewer_question": "Is the candidate break robust?",
+            "status": break_status,
+            "evidence": (
+                f"Observed best break={baseline}; threshold_within_1_period={thresh_stable}; "
+                f"provenance_within_1_period={prov_stable}; bootstrap_support={boot_support}; "
+                f"bootstrap_n={boot_n}."
+            ),
+        },
     ])
+
 
 # -----------------------------------------------------------------------------
 # Outputs and plotting
@@ -1429,15 +1689,34 @@ def capability_parameter_table(theta: np.ndarray, names: Sequence[str]) -> pd.Da
     return pd.DataFrame(rows)
 
 
-def regime_parameter_table(theta: np.ndarray, active_names: Sequence[str]) -> pd.DataFrame:
+def regime_parameter_table(
+    theta: np.ndarray,
+    active_names: Sequence[str],
+    readiness_parameter_name: str = "readiness_effect",
+) -> pd.DataFrame:
     p = unpack_regime_params(theta, len(active_names))
     rows = []
     for j, r in enumerate(REGIME_NAMES):
-        rows.append({"parameter": f"destination_intercept::{r}", "value": float(np.asarray(p["b"])[j])})
-        rows.append({"parameter": f"time_trend::{r}", "value": float(np.asarray(p["g"])[j])})
-        rows.append({"parameter": f"ANP_readiness_effect::{r}", "value": float(np.asarray(p["readiness"])[j])})
-    rows.append({"parameter": "kappa_regime_persistence", "value": float(p["kappa"])})
-    rows.append({"parameter": "eta_destination_occupancy_feedback", "value": float(p["eta"])})
+        rows.append({
+            "parameter": f"destination_intercept::{r}",
+            "value": float(np.asarray(p["b"])[j]),
+        })
+        rows.append({
+            "parameter": f"time_trend::{r}",
+            "value": float(np.asarray(p["g"])[j]),
+        })
+        rows.append({
+            "parameter": f"{readiness_parameter_name}::{r}",
+            "value": float(np.asarray(p["readiness"])[j]),
+        })
+    rows.append({
+        "parameter": "kappa_regime_persistence",
+        "value": float(p["kappa"]),
+    })
+    rows.append({
+        "parameter": "eta_destination_occupancy_feedback",
+        "value": float(p["eta"]),
+    })
     return pd.DataFrame(rows)
 
 
@@ -1450,57 +1729,25 @@ def make_plots(
     break_table: pd.DataFrame,
     outdir: Path,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(11, 6))
-    x = np.arange(len(capability_agg))
-    for c in active_names:
-        ax.plot(x, capability_agg[c], marker="o", label=c)
-    ax.set_xticks(x)
-    ax.set_xticklabels(capability_agg["period"], rotation=45, ha="right")
-    ax.set_ylim(0, 1)
-    ax.set_ylabel("Mean capability level")
-    ax.set_xlabel("Period")
-    ax.legend(fontsize=10)
-    fig.tight_layout(); fig.savefig(outdir / "continuous_capability_evolution.png", dpi=600); plt.close(fig)
+    """Create only figures included by the current manuscript TEX."""
+    fig,ax=plt.subplots(figsize=(11,6)); x=np.arange(len(capability_agg))
+    for c in active_names: ax.plot(x,capability_agg[c],marker="o",label=c)
+    ax.set_xticks(x); ax.set_xticklabels(capability_agg["period"],rotation=45,ha="right"); ax.set_ylim(0,1)
+    ax.set_ylabel("Mean capability level"); ax.set_xlabel("Period"); ax.legend(fontsize=10)
+    fig.tight_layout(); fig.savefig(outdir/"continuous_capability_evolution.png",dpi=1000); plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.bar(np.arange(len(active_names)), equilibrium)
-    ax.set_xticks(np.arange(len(active_names)))
-    ax.set_xticklabels(active_names, rotation=30, ha="right")
-    ax.set_ylim(0, 1)
-    ax.set_ylabel("Conditional equilibrium capability")
-    fig.tight_layout(); fig.savefig(outdir / "capability_conditional_equilibrium.png", dpi=600); plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(11, 6))
-    x = np.arange(len(regime_agg))
-    for r in REGIME_NAMES:
-        ax.plot(x, regime_agg[r], marker="o", label=r)
-    ax.set_xticks(x)
-    ax.set_xticklabels(regime_agg["period"], rotation=45, ha="right")
-    ax.set_ylim(0, 1)
-    ax.set_ylabel("Share of models in exclusive regime")
-    ax.set_xlabel("Period")
-    ax.legend(fontsize=10)
-    fig.tight_layout(); fig.savefig(outdir / "regime_distribution_evolution.png", dpi=600); plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(P_final, aspect="auto")
-    ax.set_xticks(np.arange(len(REGIME_NAMES))); ax.set_yticks(np.arange(len(REGIME_NAMES)))
-    ax.set_xticklabels(REGIME_NAMES, rotation=45, ha="right", fontsize=10)
-    ax.set_yticklabels(REGIME_NAMES, fontsize=10)
-    ax.set_xlabel("Destination regime"); ax.set_ylabel("Source regime")
-    fig.colorbar(im, ax=ax, label="Transition probability")
-    fig.tight_layout(); fig.savefig(outdir / "regime_final_transition_matrix.png", dpi=600); plt.close(fig)
+    fig,ax=plt.subplots(figsize=(11,6)); x=np.arange(len(regime_agg))
+    for r in REGIME_NAMES: ax.plot(x,regime_agg[r],marker="o",label=r)
+    ax.set_xticks(x); ax.set_xticklabels(regime_agg["period"],rotation=45,ha="right"); ax.set_ylim(0,1)
+    ax.set_ylabel("Share of models in exclusive regime"); ax.set_xlabel("Period"); ax.legend(fontsize=10)
+    fig.tight_layout(); fig.savefig(outdir/"regime_distribution_evolution.png",dpi=1000); plt.close(fig)
 
     if len(break_table):
-        bt = break_table.sort_values("break_transition_index")
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(np.arange(len(bt)), bt["delta_bic_two_minus_homogeneous"], marker="o")
-        ax.axhline(0.0, linewidth=1)
-        ax.set_xticks(np.arange(len(bt)))
-        ax.set_xticklabels(bt["break_after_period"], rotation=45, ha="right")
-        ax.set_ylabel("Delta BIC: two-regime minus homogeneous")
-        ax.set_xlabel("Candidate break after period")
-        fig.tight_layout(); fig.savefig(outdir / "structural_break_bic.png", dpi=600); plt.close(fig)
+        bt=break_table.sort_values("break_transition_index"); fig,ax=plt.subplots(figsize=(10,5))
+        ax.plot(np.arange(len(bt)),bt["delta_bic_two_minus_homogeneous"],marker="o"); ax.axhline(0.0,linewidth=1)
+        ax.set_xticks(np.arange(len(bt))); ax.set_xticklabels(bt["break_after_period"],rotation=45,ha="right")
+        ax.set_ylabel("Delta BIC: two-regime minus homogeneous"); ax.set_xlabel("Candidate break after period")
+        fig.tight_layout(); fig.savefig(outdir/"structural_break_bic.png",dpi=1000); plt.close(fig)
 
 
 def make_manuscript_validation_plots(
@@ -1512,90 +1759,38 @@ def make_manuscript_validation_plots(
     boot: pd.DataFrame,
     outdir: Path,
 ) -> None:
-    """Create the four reviewer-validation figures referenced by the manuscript.
-
-    These complement ``make_plots`` and use the exact filenames included by
-    ``applied_intelligence.tex``.
-    """
-    # Figure 2: ANP/network ablation.
-    if not anp_comp.empty:
-        order = ["Full_ANP_nonlinear", "No_ANP_network_baseline"]
-        tmp = anp_comp.set_index("model").reindex(order).dropna(subset=["rmse"]).reset_index()
-        labels = ["Full ANP nonlinear", "No-ANP baseline"][:len(tmp)]
-        fig, ax = plt.subplots(figsize=(8.5, 5.2))
-        x = np.arange(len(tmp))
-        vals = tmp["rmse"].to_numpy(float)
-        bars = ax.bar(x, vals)
-        ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha="right")
-        ax.set_ylabel("One-step RMSE")
-        upper = max(vals) * 1.22 if len(vals) else 1.0
-        ax.set_ylim(0.0, upper)
-        for b, v in zip(bars, vals):
-            ax.text(b.get_x()+b.get_width()/2, v + upper*0.015, f"{v:.3f}", ha="center", va="bottom")
-        fig.tight_layout(); fig.savefig(outdir / "anp_ablation_rmse.png", dpi=600); plt.close(fig)
-
-    # Figure 3: homogeneous, time-varying, and state-dependent Markov comparison.
-    if not markov_comp.empty:
-        order = ["homogeneous", "time_varying", "full_state_dependent_nonlinear"]
-        tmp = markov_comp.set_index("model").reindex(order).dropna(subset=["rmse"]).reset_index()
-        labels = ["Homogeneous", "Time-varying", "State-dependent\nnonlinear"][:len(tmp)]
-        fig, ax = plt.subplots(figsize=(8.5, 5.2))
-        x = np.arange(len(tmp))
-        vals = tmp["rmse"].to_numpy(float)
-        bars = ax.bar(x, vals)
-        ax.set_xticks(x); ax.set_xticklabels(labels)
-        ax.set_ylabel("One-step RMSE")
-        upper = max(vals) * 1.20 if len(vals) else 1.0
-        ax.set_ylim(0.0, upper)
-        for b, v in zip(bars, vals):
-            ax.text(b.get_x()+b.get_width()/2, v + upper*0.015, f"{v:.3f}", ha="center", va="bottom")
-        fig.tight_layout(); fig.savefig(outdir / "markov_baseline_rmse.png", dpi=600); plt.close(fig)
-
-    # Figure 7: structural-break sensitivity across prespecified specifications.
-    sensitivity_rows = []
+    """Generate only robustness PNGs referenced by the current TEX."""
+    sensitivity_rows=[]
     if not threshold_sens.empty:
-        wanted = {
-            "baseline": "baseline",
-            "r2=0.30": "r2=0.30",
-            "r3=0.30": "r3=0.30",
-            "r2=0.40": "r2=0.40",
-            "r3=0.40": "r3=0.40",
-        }
-        for key, label in wanted.items():
-            hit = threshold_sens.loc[threshold_sens["analysis"].astype(str) == key]
-            if len(hit): sensitivity_rows.append((label, float(hit.iloc[0]["delta_bic"])))
+        wanted={"baseline":"baseline","r2=0.30":"r2=0.30","r3=0.30":"r3=0.30","r2=0.40":"r2=0.40","r3=0.40":"r3=0.40"}
+        for key,label in wanted.items():
+            hit=threshold_sens.loc[threshold_sens["analysis"].astype(str)==key]
+            if len(hit): sensitivity_rows.append((label,float(hit.iloc[0]["delta_bic"])))
     if not aggregation_sens.empty:
-        hit = aggregation_sens.loc[aggregation_sens["aggregation"].astype(str) == "year"]
-        if len(hit): sensitivity_rows.append(("annual aggregation", float(hit.iloc[0]["delta_bic"])))
+        hit=aggregation_sens.loc[aggregation_sens["aggregation"].astype(str)=="year"]
+        if len(hit): sensitivity_rows.append(("annual aggregation",float(hit.iloc[0]["delta_bic"])))
     if not provenance_sens.empty:
-        for key, label in [
-            ("no_algorithmic_imputation", "no algorithmic imputation"),
-            ("all_strict_observed", "all strict observed"),
-        ]:
-            hit = provenance_sens.loc[provenance_sens["analysis"].astype(str) == key]
-            if len(hit): sensitivity_rows.append((label, float(hit.iloc[0]["delta_bic"])))
+        for key,label in [("no_algorithmic_imputation","no algorithmic imputation"),("all_strict_observed","all strict observed")]:
+            hit=provenance_sens.loc[provenance_sens["analysis"].astype(str)==key]
+            if len(hit): sensitivity_rows.append((label,float(hit.iloc[0]["delta_bic"])))
     if sensitivity_rows:
-        labels = [x[0] for x in sensitivity_rows]
-        vals = np.asarray([x[1] for x in sensitivity_rows], dtype=float)
-        fig, ax = plt.subplots(figsize=(9.5, 5.5))
-        y = np.arange(len(labels))
-        ax.barh(y, vals)
-        ax.set_yticks(y); ax.set_yticklabels(labels)
-        ax.axvline(0.0, linewidth=1)
-        ax.set_xlabel(r"$\Delta$ pseudo-BIC (two-segment minus homogeneous)")
-        fig.tight_layout(); fig.savefig(outdir / "break_robustness_sensitivity.png", dpi=600); plt.close(fig)
-
-    # Figure 8: fixed-candidate bootstrap distribution.
+        labels=[x[0] for x in sensitivity_rows]; vals=np.asarray([x[1] for x in sensitivity_rows],float)
+        fig,ax=plt.subplots(figsize=(9.5,5.5)); y=np.arange(len(labels)); ax.barh(y,vals); ax.set_yticks(y); ax.set_yticklabels(labels)
+        ax.axvline(0.0,linewidth=1); ax.set_xlabel(r"$\Delta$ pseudo-BIC (two-segment minus homogeneous)")
+        fig.tight_layout(); fig.savefig(outdir/"break_robustness_sensitivity.png",dpi=1000); plt.close(fig)
     if not boot.empty:
-        col = "delta_bic" if "delta_bic" in boot.columns else "best_delta_bic"
-        vals = pd.to_numeric(boot[col], errors="coerce").dropna().to_numpy(float)
+        col="delta_bic" if "delta_bic" in boot.columns else "best_delta_bic"; vals=pd.to_numeric(boot[col],errors="coerce").dropna().to_numpy(float)
         if len(vals):
-            fig, ax = plt.subplots(figsize=(8.5, 5.2))
-            ax.hist(vals, bins=min(14, max(8, int(np.sqrt(len(vals))))))
-            ax.axvline(0.0, linewidth=1)
-            ax.set_xlabel(r"Bootstrap $\Delta$ pseudo-BIC")
-            ax.set_ylabel("Frequency")
-            fig.tight_layout(); fig.savefig(outdir / "break_bootstrap_delta_bic.png", dpi=600); plt.close(fig)
+            fig,ax=plt.subplots(figsize=(8.5,5.2)); ax.hist(vals,bins=min(14,max(8,int(np.sqrt(len(vals)))))); ax.axvline(0.0,linewidth=1)
+            ax.set_xlabel(r"Bootstrap $\Delta$ pseudo-BIC"); ax.set_ylabel("Frequency")
+            fig.tight_layout(); fig.savefig(outdir/"break_bootstrap_delta_bic.png",dpi=1000); plt.close(fig)
+
+
+def remove_legacy_unused_pngs(outdir: Path) -> None:
+    """Delete PNGs generated by older script versions but unused by current TEX."""
+    for name in ["capability_conditional_equilibrium.png","regime_final_transition_matrix.png","anp_ablation_rmse.png","markov_baseline_rmse.png"]:
+        p=outdir/name
+        if p.exists(): p.unlink()
 
 
 # -----------------------------------------------------------------------------
@@ -1630,7 +1825,7 @@ def main() -> None:
         outdir / "model_reasoning_inspectability.csv", index=False, encoding="utf-8-sig"
     )
     print(f"      active capabilities: {', '.join(cap.active_names)}")
-    print("      proxy weighting: equal (fully de-nested SRWA)")
+    print("      proxy weighting: equal (no explicit S->R or R->W algebraic nesting)")
     if not cap.proxy_weights.empty:
         for capability_name, g in cap.proxy_weights.groupby("capability", sort=False):
             desc = ", ".join(f"{r.component}={r.weight:.4f}" for r in g.itertuples())
@@ -1707,27 +1902,84 @@ def main() -> None:
     for r, n in counts.items():
         print(f"        {r}: {int(n)}")
 
-    print("[8/12] Fitting non-homogeneous technological-regime Markov model")
+    print("[8/12] Fitting full-capability and scale-only state-dependent Markov models")
     reg_theta, reg_diag, reg_pred, reg_trans = fit_regime_markov(
         regime_fit, cap_fit_markov, cap.active_names, weights,
         args.ridge_regime, args.starts, args.seed,
+        readiness_label="ANP-weighted full-capability readiness r_t = w_ANP^T x_t",
     )
-    regime_parameter_table(reg_theta, cap.active_names).to_csv(
+    regime_parameter_table(
+        reg_theta, cap.active_names,
+        readiness_parameter_name="full_capability_readiness_effect",
+    ).to_csv(
         outdir / "regime_markov_parameters.csv", index=False, encoding="utf-8-sig"
     )
     reg_pred.to_csv(outdir / "regime_one_step_predictions.csv", index=False, encoding="utf-8-sig")
     reg_trans.to_csv(outdir / "regime_transition_matrices_long.csv", index=False, encoding="utf-8-sig")
+
+    # Direct scaling-sufficiency baseline: identical state-dependent Markov
+    # parameterization, but the readiness score is r_t^(S)=S_t only.
+    scale_only_weights = np.zeros(len(cap.active_names), dtype=float)
+    if "Scale" not in cap.active_names:
+        raise ValueError("Scale capability is required for the scale-only baseline.")
+    scale_only_weights[cap.active_names.index("Scale")] = 1.0
+
+    scale_theta, scale_diag, scale_pred, scale_trans = fit_regime_markov(
+        regime_fit, cap_fit_markov, cap.active_names, scale_only_weights,
+        args.ridge_regime, args.starts, args.seed,
+        readiness_label="Scale-only readiness r_t^(S) = S_t",
+    )
+    regime_parameter_table(
+        scale_theta, cap.active_names,
+        readiness_parameter_name="scale_only_readiness_effect",
+    ).to_csv(
+        outdir / "regime_scale_only_parameters.csv", index=False, encoding="utf-8-sig"
+    )
+    scale_pred.to_csv(
+        outdir / "regime_scale_only_one_step_predictions.csv",
+        index=False, encoding="utf-8-sig",
+    )
+    scale_trans.to_csv(
+        outdir / "regime_scale_only_transition_matrices_long.csv",
+        index=False, encoding="utf-8-sig",
+    )
 
     q_final = regime_fit[REGIME_NAMES].iloc[-1].to_numpy(float)
     x_final = cap_fit_markov[cap.active_names].iloc[-1].to_numpy(float)
     P_final = regime_transition_matrix(q_final, x_final, 1.0, reg_theta, weights)
     save_matrix(P_final, outdir / "regime_final_transition_matrix.csv", REGIME_NAMES, REGIME_NAMES)
 
-    print("[9/12] Comparing homogeneous, time-varying, and full Markov models")
+    P_scale_final = regime_transition_matrix(
+        q_final, x_final, 1.0, scale_theta, scale_only_weights
+    )
+    save_matrix(
+        P_scale_final,
+        outdir / "regime_scale_only_final_transition_matrix.csv",
+        REGIME_NAMES, REGIME_NAMES,
+    )
+
+    print("[9/12] Comparing homogeneous, time-varying, scale-only, and full-capability Markov models")
     markov_comp = regime_model_comparison(
-        regime_fit, reg_diag, cap.active_names, args.ridge_regime, max(2,args.starts), args.seed
+        regime_fit, reg_diag, scale_diag,
+        args.ridge_regime, max(2,args.starts), args.seed
     )
     markov_comp.to_csv(outdir / "markov_baseline_comparison.csv", index=False, encoding="utf-8-sig")
+
+    rolling_cap_detail = pd.DataFrame(); rolling_cap_summary = pd.DataFrame()
+    rolling_markov_detail = pd.DataFrame(); rolling_markov_summary = pd.DataFrame()
+    if not args.skip_rolling_origin:
+        print("[9b/12] Running expanding-window rolling-origin out-of-sample validation")
+        rolling_cap_detail, rolling_cap_summary, rolling_markov_detail, rolling_markov_summary = rolling_origin_temporal_validation(
+            df=df, capability=cap, capability_fit=cap_fit_markov, regime_fit=regime_fit,
+            period=args.period, anp_self_loop=args.anp_self_loop,
+            ridge_capability=args.ridge_capability, ridge_regime=args.ridge_regime,
+            starts=args.rolling_origin_starts, seed=args.seed,
+            min_train_periods=args.rolling_origin_min_periods,
+        )
+        rolling_cap_detail.to_csv(outdir / "rolling_origin_capability_predictions.csv", index=False, encoding="utf-8-sig")
+        rolling_cap_summary.to_csv(outdir / "rolling_origin_capability_summary.csv", index=False, encoding="utf-8-sig")
+        rolling_markov_detail.to_csv(outdir / "rolling_origin_markov_predictions.csv", index=False, encoding="utf-8-sig")
+        rolling_markov_summary.to_csv(outdir / "rolling_origin_markov_summary.csv", index=False, encoding="utf-8-sig")
 
     denested_summary = pd.DataFrame(); denested_detail: Dict[str, object] = {}
 
@@ -1787,8 +2039,10 @@ def main() -> None:
         "capability equilibrium remains in [0,1]": bool(np.all((xstar >= 0) & (xstar <= 1))),
         "capability fixed-point residual < 1e-8": bool(cap_fp_resid < 1e-8),
         "regime final transition matrix is row stochastic": bool(np.allclose(P_final.sum(axis=1), 1.0, atol=1e-10)),
+        "scale-only final transition matrix is row stochastic": bool(np.allclose(P_scale_final.sum(axis=1), 1.0, atol=1e-10)),
         "regime final prediction sums to one": bool(np.isclose(final_pred.sum(), 1.0, atol=1e-10)),
         "regime probabilities are finite": bool(np.isfinite(P_final).all()),
+        "scale-only regime probabilities are finite": bool(np.isfinite(P_scale_final).all()),
     }
 
     diagnostics = {
@@ -1801,7 +2055,7 @@ def main() -> None:
         },
         "measurement": {
             "active_capabilities": cap.active_names,
-            "proxy_weighting": "equal_de_nested",
+            "proxy_weighting": "equal_no_explicit_algebraic_nesting",
             "proxy_construction_weights": cap.proxy_weights.to_dict(orient="records"),
             "reasoning_inspectability_directly_measured": bool(cap.direct_reasoning_inspectability_available),
             "reasoning_faithfulness_directly_measured": bool(cap.direct_reasoning_faithfulness_available),
@@ -1818,9 +2072,33 @@ def main() -> None:
             {"real": float(np.real(z)), "imag": float(np.imag(z))} for z in cap_eig
         ],
         "regime_markov": reg_diag,
+        "regime_markov_scale_only": scale_diag,
+        "scaling_sufficiency_test": {
+            "scale_only_readiness_definition": "r_t^(S) = S_t",
+            "full_readiness_definition": "r_t = w_ANP^T x_t",
+            "same_nominal_parameter_count": bool(
+                int(reg_diag.get("effective_parameters", -1))
+                == int(scale_diag.get("effective_parameters", -2))
+            ),
+            "full_rmse_below_scale_only": bool(
+                float(reg_diag["rmse_one_step"]) < float(scale_diag["rmse_one_step"])
+            ),
+            "full_pseudo_bic_below_scale_only": bool(
+                float(reg_diag["pseudo_bic"]) < float(scale_diag["pseudo_bic"])
+            ),
+        },
         "reviewer_validation": {
             "anp_ablation": anp_comp.to_dict(orient="records"),
             "markov_baselines": markov_comp.to_dict(orient="records"),
+            "rolling_origin_validation": {
+                "design": "expanding-window one-step held-out temporal validation",
+                "minimum_training_periods": int(args.rolling_origin_min_periods),
+                "multistart_initializations_per_refit": int(args.rolling_origin_starts),
+                "measurement_scaling": "frozen full-sample operational proxy scale",
+                "anp_network_estimation": "re-estimated from training-period model records at each origin",
+                "capability_summary": rolling_cap_summary.to_dict(orient="records"),
+                "markov_summary": rolling_markov_summary.to_dict(orient="records"),
+            },
             "threshold_break_sensitivity": threshold_sens.to_dict(orient="records"),
             "aggregation_break_sensitivity": aggregation_sens.to_dict(orient="records"),
             "provenance_break_sensitivity": provenance_sens.to_dict(orient="records"),
@@ -1833,6 +2111,7 @@ def main() -> None:
     with open(outdir / "diagnostics.json", "w", encoding="utf-8") as f:
         json.dump(diagnostics, f, indent=2, ensure_ascii=False)
 
+    remove_legacy_unused_pngs(outdir)
     make_plots(cap_agg_all, cap.active_names, xstar, regime_agg_all, P_final, break_table, outdir)
     make_manuscript_validation_plots(
         anp_comp, markov_comp, threshold_sens, aggregation_sens, provenance_sens, boot, outdir
@@ -1860,8 +2139,33 @@ def main() -> None:
     print("\nReviewer validation: Why ANP?")
     print(anp_comp.to_string(index=False))
 
-    print("\nReviewer validation: Why nonlinear/non-homogeneous Markov?")
+    print("\nReviewer validation: Scaling sufficiency and Markov structure")
     print(markov_comp.to_string(index=False))
+
+    full_rmse = float(reg_diag["rmse_one_step"])
+    scale_rmse = float(scale_diag["rmse_one_step"])
+    scale_gain = 100.0 * (scale_rmse - full_rmse) / max(scale_rmse, 1e-15)
+    print(
+        f"  full-capability vs scale-only RMSE: {full_rmse:.6f} vs "
+        f"{scale_rmse:.6f} ({scale_gain:.2f}% lower for full capability)"
+    )
+    print(
+        f"  full-capability vs scale-only pseudo-BIC: "
+        f"{reg_diag['pseudo_bic']:.3f} vs {scale_diag['pseudo_bic']:.3f}"
+    )
+    print(
+        "  interpretation boundary: this comparison tests scale sufficiency only "
+        "within the observable three-regime state space; it does not directly "
+        "measure persistent autonomous judgment."
+    )
+
+    if not rolling_cap_summary.empty:
+        print("\nRolling-origin temporal validation: capability models (out-of-sample)")
+        print(rolling_cap_summary.to_string(index=False))
+    if not rolling_markov_summary.empty:
+        print("\nRolling-origin temporal validation: regime models (out-of-sample)")
+        print(rolling_markov_summary.to_string(index=False))
+        print("  note: proxy scaling is frozen; ANP is re-estimated using training-period model records at each origin.")
 
     if len(denested_summary):
         print("\nReviewer robustness: de-nested capability proxies (baseline regime labels fixed)")
